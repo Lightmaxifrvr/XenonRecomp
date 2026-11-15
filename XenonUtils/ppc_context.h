@@ -5,6 +5,7 @@
 #error "ppc_config.h must be included before ppc_context.h"
 #endif
 
+#include <atomic>
 #include <climits>
 #include <cmath>
 #include <csetjmp>
@@ -15,6 +16,76 @@
 #include <x86/avx.h>
 #include <x86/sse.h>
 #include <x86/sse4.1.h>
+
+// PowerPC memory barriers. On weakly-ordered hosts (ARM/Switch) the guest's
+// sync/lwsync must lower to real fences or cross-thread publishes may be lost;
+// on strongly-ordered x86 they collapse to compiler barriers as upstream.
+#if defined(__aarch64__) || defined(__arm__) || defined(__SWITCH__)
+#define PPC_SYNC()   std::atomic_thread_fence(std::memory_order_seq_cst)
+#define PPC_LWSYNC() std::atomic_thread_fence(std::memory_order_acq_rel)
+#else
+#define PPC_SYNC()   std::atomic_signal_fence(std::memory_order_seq_cst)
+#define PPC_LWSYNC() std::atomic_signal_fence(std::memory_order_acq_rel)
+#endif
+
+// stwcx./stdcx.: the store happens if the word still holds what lwarx/ldarx read. PowerPC's own
+// instructions order no other access (the guest's sync, lwsync and eieio above do); the __sync builtins
+// add a full barrier (dmb ish on ARM) to every one. With g_ppcRelaxedAtomics (Switch: [Switch]
+// SwitchRelaxedAtomics, set before any guest code runs) the compare-and-swap is a relaxed one, as
+// PowerPC's. It stays a compiler barrier: the guest memory accesses around it keep their program order in
+// the generated code, as when they were volatile (PPC_GUEST_MEMORY), which the Xbox 360's in-order cores
+// never broke either; only the processor's own reordering (as PowerPC's) remains.
+#if defined(__SWITCH__)
+extern bool g_ppcRelaxedAtomics;
+#endif
+
+static inline bool PPCStoreConditional32(uint32_t* address, uint32_t expected, uint32_t desired) noexcept
+{
+#if defined(__SWITCH__)
+    if (g_ppcRelaxedAtomics)
+    {
+        __asm__ __volatile__("" ::: "memory");
+        const bool stored = __atomic_compare_exchange_n(address, &expected, desired, false, __ATOMIC_RELAXED, __ATOMIC_RELAXED);
+        __asm__ __volatile__("" ::: "memory");
+        return stored;
+    }
+#endif
+    return __sync_bool_compare_and_swap(address, expected, desired);
+}
+
+static inline bool PPCStoreConditional64(uint64_t* address, uint64_t expected, uint64_t desired) noexcept
+{
+#if defined(__SWITCH__)
+    if (g_ppcRelaxedAtomics)
+    {
+        __asm__ __volatile__("" ::: "memory");
+        const bool stored = __atomic_compare_exchange_n(address, &expected, desired, false, __ATOMIC_RELAXED, __ATOMIC_RELAXED);
+        __asm__ __volatile__("" ::: "memory");
+        return stored;
+    }
+#endif
+    return __sync_bool_compare_and_swap(address, expected, desired);
+}
+
+// GCC does not provide the Clang/MSVC builtins emitted by XenonRecomp.
+#if defined(__GNUC__) && !defined(__clang__)
+static inline uint32_t PPCRotateLeft32(uint32_t value, unsigned int shift) noexcept
+{
+    const unsigned int amount = shift & 31;
+    return (value << amount) | (value >> ((32 - amount) & 31));
+}
+
+static inline uint64_t PPCRotateLeft64(uint64_t value, unsigned int shift) noexcept
+{
+    const unsigned int amount = shift & 63;
+    return (value << amount) | (value >> ((64 - amount) & 63));
+}
+
+#define __builtin_assume(x) do { if (!(x)) __builtin_unreachable(); } while (0)
+#define __builtin_debugtrap() __builtin_trap()
+#define __builtin_rotateleft32(x, y) PPCRotateLeft32(static_cast<uint32_t>(x), static_cast<unsigned int>(y))
+#define __builtin_rotateleft64(x, y) PPCRotateLeft64(static_cast<uint64_t>(x), static_cast<unsigned int>(y))
+#endif
 
 // SSE3 constants are missing from simde
 #ifndef _MM_DENORMALS_ZERO_MASK
@@ -31,74 +102,95 @@
 
 #define PPC_FUNC_PROLOGUE() __builtin_assume(((size_t)base & 0x1F) == 0)
 
+// A function the profile found hot: GCC optimises it harder and places it in .text.hot, next to the
+// other hot ones (tools/switch-direct-calls.py marks them from UnleashedRecompLib/config/hot_functions.txt).
+#define PPC_HOT_FUNC_IMPL(x) extern "C" __attribute__((hot)) PPC_FUNC(x)
+
+// Guest memory accesses. Plain accesses let the compiler forward a stored value to a later load of the
+// same address, drop dead loads, pair neighbouring accesses and schedule them; volatile ones forced every
+// load and store to happen, in order. Other threads still see the same things: PowerPC orders nothing
+// without sync/lwsync/eieio or a reservation, and those stay fences. What volatile also did, re-reading
+// memory on every pass of a loop that waits for another thread's store, PPC_LOOP_BARRIER() does: the
+// recompiler puts it on every backward branch. PPC_VOLATILE_GUEST_MEMORY brings the volatile accesses back.
+#ifdef PPC_VOLATILE_GUEST_MEMORY
+#define PPC_GUEST_MEMORY volatile
+#else
+#define PPC_GUEST_MEMORY
+#endif
+
+#ifndef PPC_LOOP_BARRIER
+#define PPC_LOOP_BARRIER() __asm__ __volatile__("" ::: "memory")
+#endif
+
 #ifndef PPC_LOAD_U8
-#define PPC_LOAD_U8(x) *(volatile uint8_t*)(base + (x))
+#define PPC_LOAD_U8(x) *(PPC_GUEST_MEMORY uint8_t*)(base + (x))
 #endif
 
 #ifndef PPC_LOAD_U16
-#define PPC_LOAD_U16(x) __builtin_bswap16(*(volatile uint16_t*)(base + (x)))
+#define PPC_LOAD_U16(x) __builtin_bswap16(*(PPC_GUEST_MEMORY uint16_t*)(base + (x)))
 #endif
 
 #ifndef PPC_LOAD_U32
-#define PPC_LOAD_U32(x) __builtin_bswap32(*(volatile uint32_t*)(base + (x)))
+#define PPC_LOAD_U32(x) __builtin_bswap32(*(PPC_GUEST_MEMORY uint32_t*)(base + (x)))
 #endif
 
 #ifndef PPC_LOAD_U64
-#define PPC_LOAD_U64(x) __builtin_bswap64(*(volatile uint64_t*)(base + (x)))
+#define PPC_LOAD_U64(x) __builtin_bswap64(*(PPC_GUEST_MEMORY uint64_t*)(base + (x)))
 #endif
 
 // TODO: Implement.
 // These are currently unused. However, MMIO loads could possibly be handled statically with some profiling and a fallback.
-// The fallback would be a runtime exception handler which will intercept reads from MMIO regions 
+// The fallback would be a runtime exception handler which will intercept reads from MMIO regions
 // and log the PC for compiling to static code later.
+// Memory-mapped accesses stay volatile.
 #ifndef PPC_MM_LOAD_U8
-#define PPC_MM_LOAD_U8(x)  PPC_LOAD_U8 (x)
+#define PPC_MM_LOAD_U8(x)  *(volatile uint8_t*)(base + (x))
 #endif
 
 #ifndef PPC_MM_LOAD_U16
-#define PPC_MM_LOAD_U16(x) PPC_LOAD_U16(x)
+#define PPC_MM_LOAD_U16(x) __builtin_bswap16(*(volatile uint16_t*)(base + (x)))
 #endif
 
 #ifndef PPC_MM_LOAD_U32
-#define PPC_MM_LOAD_U32(x) PPC_LOAD_U32(x)
+#define PPC_MM_LOAD_U32(x) __builtin_bswap32(*(volatile uint32_t*)(base + (x)))
 #endif
 
 #ifndef PPC_MM_LOAD_U64
-#define PPC_MM_LOAD_U64(x) PPC_LOAD_U64(x)
+#define PPC_MM_LOAD_U64(x) __builtin_bswap64(*(volatile uint64_t*)(base + (x)))
 #endif
 
 #ifndef PPC_STORE_U8
-#define PPC_STORE_U8(x, y) *(volatile uint8_t*)(base + (x)) = (y)
+#define PPC_STORE_U8(x, y) *(PPC_GUEST_MEMORY uint8_t*)(base + (x)) = (y)
 #endif
 
 #ifndef PPC_STORE_U16
-#define PPC_STORE_U16(x, y) *(volatile uint16_t*)(base + (x)) = __builtin_bswap16(y)
+#define PPC_STORE_U16(x, y) *(PPC_GUEST_MEMORY uint16_t*)(base + (x)) = __builtin_bswap16(y)
 #endif
 
 #ifndef PPC_STORE_U32
-#define PPC_STORE_U32(x, y) *(volatile uint32_t*)(base + (x)) = __builtin_bswap32(y)
+#define PPC_STORE_U32(x, y) *(PPC_GUEST_MEMORY uint32_t*)(base + (x)) = __builtin_bswap32(y)
 #endif
 
 #ifndef PPC_STORE_U64
-#define PPC_STORE_U64(x, y) *(volatile uint64_t*)(base + (x)) = __builtin_bswap64(y)
+#define PPC_STORE_U64(x, y) *(PPC_GUEST_MEMORY uint64_t*)(base + (x)) = __builtin_bswap64(y)
 #endif
 
 // MMIO Store handling is completely reliant on being preeceded by eieio.
 // TODO: Verify if that's always the case.
 #ifndef PPC_MM_STORE_U8
-#define PPC_MM_STORE_U8(x, y)   PPC_STORE_U8 (x, y)
+#define PPC_MM_STORE_U8(x, y)   *(volatile uint8_t*)(base + (x)) = (y)
 #endif
 
 #ifndef PPC_MM_STORE_U16
-#define PPC_MM_STORE_U16(x, y)  PPC_STORE_U16(x, y)
+#define PPC_MM_STORE_U16(x, y)  *(volatile uint16_t*)(base + (x)) = __builtin_bswap16(y)
 #endif
 
 #ifndef PPC_MM_STORE_U32
-#define PPC_MM_STORE_U32(x, y)  PPC_STORE_U32(x, y)
+#define PPC_MM_STORE_U32(x, y)  *(volatile uint32_t*)(base + (x)) = __builtin_bswap32(y)
 #endif
 
 #ifndef PPC_MM_STORE_U64
-#define PPC_MM_STORE_U64(x, y)  PPC_STORE_U64(x, y)
+#define PPC_MM_STORE_U64(x, y)  *(volatile uint64_t*)(base + (x)) = __builtin_bswap64(y)
 #endif
 
 #ifndef PPC_CALL_FUNC
@@ -692,9 +784,15 @@ inline simde__m128i simde_mm_vsr(simde__m128i a, simde__m128i b)
 inline uint64_t __rdtsc()
 {
     uint64_t ret;
+#if defined(__SWITCH__)
+    asm volatile("mrs %x[data], cntpct_el0"
+                 : [data] "=r"(ret)::"memory");
+    return ret;
+#else
     asm volatile("mrs %0, cntvct_el0\n\t"
                  : "=r"(ret)::"memory");
     return ret;
+#endif
 }
 #elif !defined(__x86_64__) && !defined(_M_X64)
 #   error "Missing implementation for __rdtsc()"

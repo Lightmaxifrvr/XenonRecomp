@@ -128,12 +128,19 @@ struct XACHEntry
 
 union XDBFTitleID
 {
+#if defined(__SWITCH__) || (defined(__GNUC__) && !defined(__clang__))
+    struct Parts
+    {
+        be<uint16_t> u16;
+        char u8[0x02];
+    } parts;
+#else
     struct
     {
         be<uint16_t> u16;
         char u8[0x02];
     };
-
+#endif
     be<uint32_t> u32;
 };
 

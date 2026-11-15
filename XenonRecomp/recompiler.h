@@ -35,6 +35,29 @@ struct Recompiler
     size_t cppFileIndex = 0;
     RecompilerConfig config;
 
+    // [Switch] Code generation (all three off with XENON_RECOMP_CLASSIC=1, for A/B builds):
+    //  - loopBarriers: PPC_LOOP_BARRIER() on every backward branch, so that guest memory accesses
+    //    can be plain ones (ppc_context.h) and loops still read memory again on every pass;
+    //  - skipCalleeSaves: with non-volatile registers as locals, the prologue stores of callee-saved
+    //    registers (and of the link register) write locals that nothing reads: they are dropped;
+    //  - csrAcrossLabels: the FPSCR flush mode is known at a label when every way into it agrees,
+    //    instead of being checked again after every label.
+    bool loopBarriers = true;
+    bool skipCalleeSaves = true;
+    bool csrAcrossLabels = true;
+
+    // Per function: the flush mode assumed at each label while printing, and the meet of the modes
+    // recorded on the branches into each label (a missing entry means no branch recorded yet).
+    std::unordered_map<uint32_t, CSRState> csrLabelIn;
+    std::unordered_map<uint32_t, CSRState> csrLabelEdges;
+    void RecordCsrEdge(uint32_t target, CSRState state);
+
+    // Addresses of the prologue stores dropped by skipCalleeSaves in the current function.
+    std::unordered_set<uint32_t> skippedSaves;
+
+    // No warnings while a function body is printed only to analyse it.
+    bool quiet = false;
+
     bool LoadConfig(const std::string_view& configFilePath);
 
     template<class... Args>
