@@ -14,6 +14,15 @@ bool Recompiler::LoadConfig(const std::string_view& configFilePath)
 {
     config.Load(configFilePath);
 
+    // [Switch] The code generation of before round 7, for A/B builds (see recompiler.h).
+    if (const char* classic = std::getenv("XENON_RECOMP_CLASSIC"); classic != nullptr && classic[0] == '1')
+    {
+        loopBarriers = false;
+        skipCalleeSaves = false;
+        csrAcrossLabels = false;
+        fmt::println("XENON_RECOMP_CLASSIC=1: no loop barriers, callee-saved stores kept, CSR state unknown at labels");
+    }
+
     std::vector<uint8_t> file;
     if (!config.patchedFilePath.empty())
         file = LoadFile((config.directoryPath + config.patchedFilePath).c_str());
@@ -404,6 +413,17 @@ bool Recompiler::Recompile(
             }
         };
 
+    // A branch to a label of this function: records the flush mode it carries there, and on a backward
+    // branch (a loop) makes the compiler read guest memory again on the next pass.
+    auto printGoto = [&](std::string_view prefix, uint32_t target)
+        {
+            RecordCsrEdge(target, csrState);
+            if (loopBarriers && target <= base)
+                println("{}{{ PPC_LOOP_BARRIER(); goto loc_{:X}; }}", prefix, target);
+            else
+                println("{}goto loc_{:X};", prefix, target);
+        };
+
     auto printConditionalBranch = [&](bool not_, const std::string_view& cond)
         {
             if (insn.operands[1] < fn.base || insn.operands[1] >= fn.base + fn.size)
@@ -416,7 +436,7 @@ bool Recompiler::Recompile(
             }
             else
             {
-                println("\tif ({}{}.{}) goto loc_{:X};", not_ ? "!" : "", cr(insn.operands[0]), cond, insn.operands[1]);
+                printGoto(fmt::format("\tif ({}{}.{}) ", not_ ? "!" : "", cr(insn.operands[0]), cond), insn.operands[1]);
             }
         };
 
@@ -487,10 +507,14 @@ bool Recompiler::Recompile(
             {
                 println(")) {{");
 
+                // The hook is host code that may call guest code: the flush mode is unknown after it.
+                if (csrAcrossLabels)
+                    csrState = CSRState::Unknown;
+
                 if (midAsmHook->second.returnOnTrue)
                     println("\t\treturn;");
                 else if (midAsmHook->second.jumpAddressOnTrue != NULL)
-                    println("\t\tgoto loc_{:X};", midAsmHook->second.jumpAddressOnTrue);
+                    printGoto("\t\t", midAsmHook->second.jumpAddressOnTrue);
 
                 println("\t}}");
 
@@ -499,7 +523,7 @@ bool Recompiler::Recompile(
                 if (midAsmHook->second.returnOnFalse)
                     println("\t\treturn;");
                 else if (midAsmHook->second.jumpAddressOnFalse != NULL)
-                    println("\t\tgoto loc_{:X};", midAsmHook->second.jumpAddressOnFalse);
+                    printGoto("\t\t", midAsmHook->second.jumpAddressOnFalse);
 
                 println("\t}}");
             }
@@ -507,10 +531,13 @@ bool Recompiler::Recompile(
             {
                 println(");");
 
+                if (csrAcrossLabels)
+                    csrState = CSRState::Unknown;
+
                 if (midAsmHook->second.ret)
                     println("\treturn;");
                 else if (midAsmHook->second.jumpAddress != NULL)
-                    println("\tgoto loc_{:X};", midAsmHook->second.jumpAddress);
+                    printGoto("\t", midAsmHook->second.jumpAddress);
             }
         };
 
@@ -602,13 +629,25 @@ bool Recompiler::Recompile(
         }
         else
         {
-            println("\tgoto loc_{:X};", insn.operands[0]);
+            printGoto("\t", insn.operands[0]);
         }
         break;
 
     case PPC_INST_BCTR:
         if (switchTable != config.switchTables.end())
         {
+            if (loopBarriers)
+            {
+                for (auto label : switchTable->second.labels)
+                {
+                    if (label <= base && label >= fn.base)
+                    {
+                        println("\tPPC_LOOP_BARRIER();");
+                        break;
+                    }
+                }
+            }
+
             println("\tswitch ({}.u64) {{", r(switchTable->second.r));
 
             for (size_t i = 0; i < switchTable->second.labels.size(); i++)
@@ -618,11 +657,13 @@ bool Recompiler::Recompile(
                 if (label < fn.base || label >= fn.base + fn.size)
                 {
                     println("\t\t// ERROR: 0x{:X}", label);
-                    fmt::println("ERROR: Switch case at {:X} is trying to jump outside function: {:X}", base, label);
+                    if (!quiet)
+                        fmt::println("ERROR: Switch case at {:X} is trying to jump outside function: {:X}", base, label);
                     println("\t\treturn;");
                 }
                 else
                 {
+                    RecordCsrEdge(label, csrState);
                     println("\t\tgoto loc_{:X};", label);
                 }
             }
@@ -649,7 +690,7 @@ bool Recompiler::Recompile(
 
     case PPC_INST_BDZ:
         println("\t--{}.u64;", ctr());
-        println("\tif ({}.u32 == 0) goto loc_{:X};", ctr(), insn.operands[0]);
+        printGoto(fmt::format("\tif ({}.u32 == 0) ", ctr()), insn.operands[0]);
         break;
 
     case PPC_INST_BDZLR:
@@ -659,13 +700,13 @@ bool Recompiler::Recompile(
 
     case PPC_INST_BDNZ:
         println("\t--{}.u64;", ctr());
-        println("\tif ({}.u32 != 0) goto loc_{:X};", ctr(), insn.operands[0]);
+        printGoto(fmt::format("\tif ({}.u32 != 0) ", ctr()), insn.operands[0]);
         break;
 
     case PPC_INST_BDNZF:
         // NOTE: assuming eq here as a shortcut because all the instructions in the game do that
         println("\t--{}.u64;", ctr());
-        println("\tif ({}.u32 != 0 && !{}.eq) goto loc_{:X};", ctr(), cr(insn.operands[0] / 4), insn.operands[1]);
+        printGoto(fmt::format("\tif ({}.u32 != 0 && !{}.eq) ", ctr(), cr(insn.operands[0] / 4)), insn.operands[1]);
         break;
 
     case PPC_INST_BEQ:
@@ -849,7 +890,8 @@ bool Recompiler::Recompile(
         break;
 
     case PPC_INST_EIEIO:
-        // no op
+        // Store-ordering barrier (guest uses it to publish data before a flag).
+        println("\tPPC_LWSYNC();");
         break;
 
     case PPC_INST_EXTSB:
@@ -1209,7 +1251,7 @@ bool Recompiler::Recompile(
         break;
 
     case PPC_INST_LWSYNC:
-        // no op
+        println("\tPPC_LWSYNC();");
         break;
 
     case PPC_INST_LWZ:
@@ -1503,10 +1545,10 @@ bool Recompiler::Recompile(
     case PPC_INST_STDCX:
         println("\t{}.lt = 0;", cr(0));
         println("\t{}.gt = 0;", cr(0));
-        print("\t{}.eq = __sync_bool_compare_and_swap(reinterpret_cast<uint64_t*>(base + ", cr(0));
+        print("\t{}.eq = PPCStoreConditional64(reinterpret_cast<uint64_t*>(base + ", cr(0));
         if (insn.operands[1] != 0)
             print("{}.u32 + ", r(insn.operands[1]));
-        println("{}.u32), {}.s64, __builtin_bswap64({}.s64));", r(insn.operands[2]), reserved(), r(insn.operands[0]));
+        println("{}.u32), {}.u64, __builtin_bswap64({}.u64));", r(insn.operands[2]), reserved(), r(insn.operands[0]));
         println("\t{}.so = {}.so;", cr(0), xer());
         break;
 
@@ -1658,10 +1700,10 @@ bool Recompiler::Recompile(
     case PPC_INST_STWCX:
         println("\t{}.lt = 0;", cr(0));
         println("\t{}.gt = 0;", cr(0));
-        print("\t{}.eq = __sync_bool_compare_and_swap(reinterpret_cast<uint32_t*>(base + ", cr(0));
+        print("\t{}.eq = PPCStoreConditional32(reinterpret_cast<uint32_t*>(base + ", cr(0));
         if (insn.operands[1] != 0)
             print("{}.u32 + ", r(insn.operands[1]));
-        println("{}.u32), {}.s32, __builtin_bswap32({}.s32));", r(insn.operands[2]), reserved(), r(insn.operands[0]));
+        println("{}.u32), {}.u32, __builtin_bswap32({}.u32));", r(insn.operands[2]), reserved(), r(insn.operands[0]));
         println("\t{}.so = {}.so;", cr(0), xer());
         break;
 
@@ -1711,7 +1753,7 @@ bool Recompiler::Recompile(
         break;
 
     case PPC_INST_SYNC:
-        // no op
+        println("\tPPC_SYNC();");
         break;
 
     case PPC_INST_TDLGEI:
@@ -2002,7 +2044,7 @@ bool Recompiler::Recompile(
         {
         case 0: // D3D color
             if (insn.operands[3] != 1)
-                fmt::println("Unexpected D3D color pack instruction at {:X}", base);
+                if (!quiet) fmt::println("Unexpected D3D color pack instruction at {:X}", base);
 
             for (size_t i = 0; i < 4; i++)
             {
@@ -2016,7 +2058,7 @@ bool Recompiler::Recompile(
 
         case 5: // float16_4
             if (insn.operands[3] != 2 || insn.operands[4] > 2)
-                fmt::println("Unexpected float16_4 pack instruction at {:X}", base);
+                if (!quiet) fmt::println("Unexpected float16_4 pack instruction at {:X}", base);
 
             for (size_t i = 0; i < 4; i++)
             {
@@ -2272,7 +2314,7 @@ bool Recompiler::Recompile(
     {
         int lastLine = out.find_last_of('\n', out.size() - 2);
         if (out.find("cr0", lastLine + 1) == std::string::npos && out.find("cr6", lastLine + 1) == std::string::npos)
-            fmt::println("{} at {:X} has RC bit enabled but no comparison was generated", insn.opcode->name, base);
+            if (!quiet) fmt::println("{} at {:X} has RC bit enabled but no comparison was generated", insn.opcode->name, base);
     }
 #endif
 
@@ -2280,6 +2322,13 @@ bool Recompiler::Recompile(
         printMidAsmHook();
     
     return true;
+}
+
+void Recompiler::RecordCsrEdge(uint32_t target, CSRState state)
+{
+    auto [edge, inserted] = csrLabelEdges.emplace(target, state);
+    if (!inserted && edge->second != state)
+        edge->second = CSRState::Unknown;
 }
 
 bool Recompiler::Recompile(const Function& fn)
@@ -2388,9 +2437,73 @@ bool Recompiler::Recompile(const Function& fn)
     println("PPC_FUNC_IMPL(__imp__{}) {{", name);
     println("\tPPC_FUNC_PROLOGUE();");
 
-    auto switchTable = config.switchTables.end();
-    bool allRecompiled = true;
-    CSRState csrState = CSRState::Unknown;
+    // [Switch] skipCalleeSaves. With non-volatile registers as locals, the stores of callee-saved
+    // registers (and of the link register) that open a function write this function's own, fresh
+    // locals: the caller's registers are the caller's locals, and the restores in the epilogues load
+    // them back into locals that are dead. Nothing can read what these stores wrote. Only the run of
+    // stores at the very start, before the frame is allocated (stwu) and before any label or hook,
+    // counts; a store after any other instruction may be a real spill.
+    skippedSaves.clear();
+    if (skipCalleeSaves && config.nonVolatileRegistersAsLocalVariables)
+    {
+        enum class R12 { Unknown, LinkRegister, Offset, StackAddress } r12 = R12::Unknown;
+        const uint32_t* scan = data;
+        ppc_insn scanInsn;
+        for (uint32_t address = fn.base; address < end; address += 4, ++scan)
+        {
+            if ((address != fn.base && labels.find(address) != labels.end()) ||
+                config.midAsmHooks.find(address) != config.midAsmHooks.end())
+            {
+                break;
+            }
+
+            ppc::Disassemble(scan, 4, address, scanInsn);
+            if (scanInsn.opcode == nullptr)
+                break;
+
+            const auto id = scanInsn.opcode->id;
+            const auto* op = scanInsn.operands;
+            const bool nonVolatileVmx = (op[0] >= 14 && op[0] <= 31) || (op[0] >= 64 && op[0] <= 127);
+
+            if (id == PPC_INST_MFLR && op[0] == 12)
+            {
+                r12 = R12::LinkRegister;
+            }
+            else if (id == PPC_INST_LI && op[0] == 12 && int32_t(op[1]) < 0)
+            {
+                r12 = R12::Offset;
+            }
+            else if (id == PPC_INST_ADDI && op[0] == 12 && op[1] == 1 && int32_t(op[2]) < 0)
+            {
+                r12 = R12::StackAddress;
+            }
+            else if (id == PPC_INST_STW && op[0] == 12 && op[2] == 1 && int32_t(op[1]) < 0 && r12 == R12::LinkRegister)
+            {
+                skippedSaves.emplace(address);
+            }
+            else if ((id == PPC_INST_STD || id == PPC_INST_STW || id == PPC_INST_STFD) && op[0] >= 14 && op[0] <= 31 &&
+                op[2] == 1 && int32_t(op[1]) < 0)
+            {
+                skippedSaves.emplace(address);
+            }
+            else if ((id == PPC_INST_STVX || id == PPC_INST_STVX128) && nonVolatileVmx && op[2] == 12 &&
+                ((op[1] == 1 && r12 == R12::Offset) || (op[1] == 0 && r12 == R12::StackAddress)))
+            {
+                skippedSaves.emplace(address);
+            }
+            else if (id == PPC_INST_BL)
+            {
+                // The save helpers (__savegprlr_N, __savefpr_N, __savevmx_N) print nothing already.
+                auto target = image.symbols.find(op[0]);
+                if (target == image.symbols.end() || target->address != op[0] || target->name.find("__save") != 0)
+                    break;
+            }
+            else
+            {
+                break;
+            }
+        }
+    }
 
     // TODO: the printing scheme here is scuffed
     RecompilerLocalVariables localVariables;
@@ -2398,45 +2511,121 @@ bool Recompiler::Recompile(const Function& fn)
     tempString.clear();
     std::swap(out, tempString);
 
-    ppc_insn insn;
-    while (base < end)
-    {
-        if (labels.find(base) != labels.end())
+    const uint32_t* const bodyData = data;
+    auto printBody = [&]() -> bool
         {
-            println("loc_{:X}:", base);
+            uint32_t base = fn.base;
+            const uint32_t* data = bodyData;
+            auto switchTable = config.switchTables.end();
+            bool allRecompiled = true;
+            CSRState csrState = CSRState::Unknown;
+            bool fallsThrough = true;
 
-            // Anyone could jump to this label so we wouldn't know what the CSR state would be.
-            csrState = CSRState::Unknown;
-        }
+            // Callers leave the flush mode unknown.
+            if (labels.find(fn.base) != labels.end())
+                RecordCsrEdge(fn.base, CSRState::Unknown);
 
-        if (switchTable == config.switchTables.end())
-            switchTable = config.switchTables.find(base);
-
-        ppc::Disassemble(data, 4, base, insn);
-
-        if (insn.opcode == nullptr)
-        {
-            println("\t// {}", insn.op_str);
-#if 1
-            if (*data != 0)
-                fmt::println("Unable to decode instruction {:X} at {:X}", *data, base);
-#endif
-        }
-        else
-        {
-            if (insn.opcode->id == PPC_INST_BCTR && (*(data - 1) == 0x07008038 || *(data - 1) == 0x00000060) && switchTable == config.switchTables.end())
-                fmt::println("Found a switch jump table at {:X} with no switch table entry present", base);
-
-            if (!Recompile(fn, base, insn, data, switchTable, localVariables, csrState))
+            ppc_insn insn;
+            while (base < end)
             {
-                fmt::println("Unrecognized instruction at 0x{:X}: {}", base, insn.opcode->name);
-                allRecompiled = false;
+                if (labels.find(base) != labels.end())
+                {
+                    println("loc_{:X}:", base);
+
+                    if (base != fn.base && fallsThrough)
+                        RecordCsrEdge(base, csrState);
+
+                    // Anyone could jump to this label, so the CSR state is whatever every way in agrees on
+                    // ([Switch] csrAcrossLabels; unknown when they differ or none was recorded).
+                    auto assumed = csrAcrossLabels ? csrLabelIn.find(base) : csrLabelIn.end();
+                    csrState = assumed != csrLabelIn.end() ? assumed->second : CSRState::Unknown;
+                }
+
+                if (switchTable == config.switchTables.end())
+                    switchTable = config.switchTables.find(base);
+
+                ppc::Disassemble(data, 4, base, insn);
+
+                if (insn.opcode == nullptr)
+                {
+                    println("\t// {}", insn.op_str);
+#if 1
+                    if (*data != 0 && !quiet)
+                        fmt::println("Unable to decode instruction {:X} at {:X}", *data, base);
+#endif
+                    fallsThrough = true;
+                }
+                else if (skippedSaves.find(base) != skippedSaves.end())
+                {
+                    println("\t// {} {}", insn.opcode->name, insn.op_str);
+                    println("\t// callee-saved register store dropped (skipCalleeSaves)");
+                    fallsThrough = true;
+                }
+                else
+                {
+                    if (insn.opcode->id == PPC_INST_BCTR && (*(data - 1) == 0x07008038 || *(data - 1) == 0x00000060) &&
+                        switchTable == config.switchTables.end() && !quiet)
+                    {
+                        fmt::println("Found a switch jump table at {:X} with no switch table entry present", base);
+                    }
+
+                    if (!Recompile(fn, base, insn, data, switchTable, localVariables, csrState))
+                    {
+                        if (!quiet)
+                            fmt::println("Unrecognized instruction at 0x{:X}: {}", base, insn.opcode->name);
+                        allRecompiled = false;
+                    }
+
+                    const auto id = insn.opcode->id;
+                    fallsThrough = id != PPC_INST_B && id != PPC_INST_BLR && id != PPC_INST_BCTR;
+                }
+
+                base += 4;
+                ++data;
             }
+
+            return allRecompiled;
+        };
+
+    // [Switch] csrAcrossLabels: print the body until the modes assumed at the labels are the ones its
+    // branches carry. Assumptions only become known ones (a branch's mode is either set by an
+    // instruction since the last label or inherited from it), so this settles; after a few passes
+    // without settling, nothing is assumed, as before.
+    csrLabelIn.clear();
+    bool allRecompiled = true;
+    for (uint32_t pass = 0; ; pass++)
+    {
+        out.clear();
+        localVariables = {};
+        csrLabelEdges.clear();
+        quiet = pass != 0;
+        allRecompiled = printBody();
+
+        if (!csrAcrossLabels)
+            break;
+
+        std::unordered_map<uint32_t, CSRState> known;
+        for (const auto& [label, state] : csrLabelEdges)
+        {
+            if (state != CSRState::Unknown)
+                known.emplace(label, state);
         }
 
-        base += 4;
-        ++data;
+        if (known == csrLabelIn)
+            break;
+
+        if (pass == 8)
+        {
+            csrLabelIn.clear();
+            out.clear();
+            localVariables = {};
+            allRecompiled = printBody();
+            break;
+        }
+
+        csrLabelIn = std::move(known);
     }
+    quiet = false;
 
 #if 0
     if (insn.opcode == nullptr || (insn.opcode->id != PPC_INST_B && insn.opcode->id != PPC_INST_BCTR && insn.opcode->id != PPC_INST_BLR))

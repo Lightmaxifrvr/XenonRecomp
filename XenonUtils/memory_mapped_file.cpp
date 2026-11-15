@@ -1,6 +1,9 @@
 #include "memory_mapped_file.h"
 
-#if !defined(_WIN32)
+#if defined(__SWITCH__)
+#   include <fstream>
+#elif !defined(_WIN32)
+#   include <cerrno>
 #   include <cstring>
 #   include <cstdio>
 #   include <fcntl.h>
@@ -34,6 +37,11 @@ MemoryMappedFile::MemoryMappedFile(MemoryMappedFile &&other)
     other.fileMappingHandle = nullptr;
     other.fileView = nullptr;
     other.fileSize.QuadPart = 0;
+#elif defined(__SWITCH__)
+    fileData = std::move(other.fileData);
+    opened = other.opened;
+
+    other.opened = false;
 #else
     fileHandle = other.fileHandle;
     fileView = other.fileView;
@@ -85,6 +93,41 @@ bool MemoryMappedFile::open(const std::filesystem::path &path)
     }
 
     return true;
+#elif defined(__SWITCH__)
+    close();
+
+    const auto pathU8 = path.u8string();
+    const std::string pathString(reinterpret_cast<const char*>(pathU8.c_str()));
+    std::ifstream file(pathString, std::ios::binary | std::ios::ate);
+    if (!file.is_open())
+    {
+        fprintf(stderr, "open for %s failed.\n", pathString.c_str());
+        return false;
+    }
+
+    const auto endPosition = file.tellg();
+    if (endPosition < 0)
+    {
+        fprintf(stderr, "tellg failed for %s.\n", pathString.c_str());
+        return false;
+    }
+
+    fileData.resize(static_cast<size_t>(endPosition));
+    file.seekg(0, std::ios::beg);
+
+    if (!fileData.empty())
+    {
+        file.read(reinterpret_cast<char*>(fileData.data()), fileData.size());
+        if (!file)
+        {
+            fprintf(stderr, "read for %s failed.\n", pathString.c_str());
+            fileData.clear();
+            return false;
+        }
+    }
+
+    opened = true;
+    return true;
 #else
     fileHandle = ::open(path.c_str(), O_RDONLY);
     if (fileHandle == -1)
@@ -132,6 +175,9 @@ void MemoryMappedFile::close()
     {
         CloseHandle(fileHandle);
     }
+#elif defined(__SWITCH__)
+    fileData.clear();
+    opened = false;
 #else
     if (fileView != MAP_FAILED)
     {
@@ -149,6 +195,8 @@ bool MemoryMappedFile::isOpen() const
 {
 #if defined(_WIN32)
     return (fileView != nullptr);
+#elif defined(__SWITCH__)
+    return opened;
 #else
     return (fileView != MAP_FAILED);
 #endif
@@ -156,13 +204,19 @@ bool MemoryMappedFile::isOpen() const
 
 uint8_t *MemoryMappedFile::data() const
 {
+#if defined(__SWITCH__)
+    return const_cast<uint8_t*>(fileData.data());
+#else
     return reinterpret_cast<uint8_t *>(fileView);
+#endif
 }
 
 size_t MemoryMappedFile::size() const
 {
 #if defined(_WIN32)
     return fileSize.QuadPart;
+#elif defined(__SWITCH__)
+    return fileData.size();
 #else
     return static_cast<size_t>(fileSize);
 #endif
